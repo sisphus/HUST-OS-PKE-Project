@@ -8,6 +8,15 @@
 #include "riscv.h"
 #include "spike_interface/spike_utils.h"
 
+#define DEBUG_LINE_STORAGE_SIZE (128 * 1024)
+#define DEBUG_SECTION_NAMES_SIZE (4 * 1024)
+#define MAX_DEBUG_FILES 64
+#define SOURCE_PATH_SIZE 512
+#define SOURCE_LINE_SIZE 256
+
+__attribute__((aligned(8))) static char debug_line_storage[DEBUG_LINE_STORAGE_SIZE];
+static char debug_section_names[DEBUG_SECTION_NAMES_SIZE];
+
 typedef struct elf_info_t {
   spike_file_t *f;
   process *p;
@@ -30,6 +39,13 @@ static uint64 elf_fpread(elf_ctx *ctx, void *dest, uint64 nb, uint64 offset) {
   // spike_file_pread will read the elf file (msg->f) from offset to memory (indicated by
   // *dest) for nb bytes.
   return spike_file_pread(msg->f, dest, nb, offset);
+}
+
+static int read_section_header(elf_ctx *ctx, uint16 index, elf_sect_header* section) {
+    if (index >= ctx->ehdr.shnum || ctx->ehdr.shentsize < sizeof(*section)) return 0;
+
+    uint64 offset = ctx->ehdr.shoff + (uint64)index * ctx->ehdr.shentsize;
+    return elf_fpread(ctx, section, sizeof(*section), offset) == sizeof(*section);
 }
 
 //
@@ -194,6 +210,116 @@ endop:;
     //     sprint("%p %d %d\n", p->line[i].addr, p->line[i].line, p->line[i].file);
 }
 
+static void load_debug_line(elf_ctx *ctx) {
+    if (ctx->ehdr.shstrndx >= ctx->ehdr.shnum) return;
+
+    elf_sect_header section_name_table;
+    if (!read_section_header(ctx, ctx->ehdr.shstrndx, &section_name_table))
+        panic("Fail to read section name table.\n");
+    if (section_name_table.size > sizeof(debug_section_names))
+        panic("Section name table is too large.\n");
+    if (elf_fpread(ctx, debug_section_names, section_name_table.size,
+                   section_name_table.offset) != section_name_table.size)
+        panic("Fail to load section name table.\n");
+
+    for (uint16 i = 0; i < ctx->ehdr.shnum; i++) {
+        elf_sect_header section;
+        if (!read_section_header(ctx, i, &section))
+            panic("Fail to read section header.\n");
+        if (section.name >= section_name_table.size) continue;
+
+        char* section_name = debug_section_names + section.name;
+        if (strcmp(section_name, ".debug_line") != 0) continue;
+        if (section.size > sizeof(debug_line_storage) - 4096)
+            panic("Debug line section is too large.\n");
+        if (elf_fpread(ctx, debug_line_storage, section.size, section.offset) != section.size)
+            panic("Fail to load debug line section.\n");
+
+        make_addr_line(ctx, debug_line_storage, section.size);
+        return;
+    }
+}
+
+static int append_text(char* dest, size_t dest_size, size_t* used, const char* text) {
+    while (*text) {
+        if (*used + 1 >= dest_size) return 0;
+        dest[(*used)++] = *text++;
+    }
+    return 1;
+}
+
+static int build_source_path(process* p, uint64 file_index, char* path, size_t path_size) {
+    if (!p || !p->dir || !p->file || file_index >= MAX_DEBUG_FILES) return 0;
+
+    code_file* source_file = &p->file[file_index];
+    if (!source_file->file || source_file->dir >= MAX_DEBUG_FILES || !p->dir[source_file->dir])
+        return 0;
+
+    const char* directory = p->dir[source_file->dir];
+    size_t used = 0;
+    if (*directory) {
+        if (!append_text(path, path_size, &used, directory)) return 0;
+        if (used > 0 && path[used - 1] != '/') {
+            if (used + 1 >= path_size) return 0;
+            path[used++] = '/';
+        }
+    }
+    if (!append_text(path, path_size, &used, source_file->file)) return 0;
+    path[used] = '\0';
+    return 1;
+}
+
+static int read_source_line(const char* path, uint64 target_line, char* line, size_t line_size) {
+    if (!path || target_line == 0 || line_size == 0) return 0;
+
+    spike_file_t* source = spike_file_open(path, O_RDONLY, 0);
+    if (IS_ERR_VALUE(source)) return 0;
+
+    uint64 line_number = 1;
+    size_t length = 0;
+    int found = 0;
+    char ch;
+    while (spike_file_read(source, &ch, 1) == 1) {
+        if (ch == '\n') {
+            if (line_number == target_line) {
+                found = 1;
+                break;
+            }
+            line_number++;
+            length = 0;
+        } else if (line_number == target_line && length + 1 < line_size) {
+            line[length++] = ch;
+        }
+    }
+
+    if (!found && line_number == target_line && length > 0) found = 1;
+    line[length] = '\0';
+    spike_file_close(source);
+    return found;
+}
+
+void print_error_line(process* p, uint64 addr) {
+    if (!p || !p->line || p->line_ind <= 0) return;
+
+    int best = -1;
+    for (int i = 0; i < p->line_ind; i++) {
+        if (p->line[i].addr <= addr &&
+            (best < 0 || p->line[i].addr > p->line[best].addr))
+            best = i;
+    }
+    if (best < 0) return;
+
+    addr_line* location = &p->line[best];
+    char path[SOURCE_PATH_SIZE];
+    if (!build_source_path(p, location->file, path, sizeof(path))) return;
+
+    sprint("Runtime error at %s:%d\n", path, (int)location->line);
+
+    char source_line[SOURCE_LINE_SIZE];
+    if (read_source_line(path, location->line, source_line, sizeof(source_line)))
+        sprint("%s\n", source_line);
+}
+
 //
 // load the elf segments to memory regions as we are in Bare mode in lab1
 //
@@ -276,6 +402,8 @@ void load_bincode_from_host_elf(process *p) {
 
   // load elf. elf_load() is defined above.
   if (elf_load(&elfloader) != EL_OK) panic("Fail on loading elf.\n");
+
+  load_debug_line(&elfloader);
 
   // entry (virtual, also physical in lab1_x) address
   p->trapframe->epc = elfloader.ehdr.entry;
