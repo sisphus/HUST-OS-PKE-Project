@@ -6,6 +6,8 @@
 #include "process.h"
 #include "strap.h"
 #include "syscall.h"
+#include "elf.h"
+#include "string.h"
 
 #include "spike_interface/spike_utils.h"
 
@@ -36,6 +38,27 @@ void handle_mtimer_trap() {
   g_ticks++;
   write_csr(sip, read_csr(sip) & ~SIP_SSIP);
 
+}
+
+void handle_print_backtrace(uint64 depth) {
+  uint64 fp = current->trapframe->regs.s0;
+
+  // The trap occurs inside do_user_call(). Skip that helper's frame so the
+  // first saved return address belongs to the application function f8.
+  if (fp != 0) fp = *((uint64*)(fp - 16));
+
+  for (uint64 i = 0; i < depth && fp != 0; i++) {
+    uint64 ra = *((uint64*)(fp - 8));
+    char function_name[64];
+
+    if (!elf_lookup_symbol(ra, function_name, sizeof(function_name))) break;
+    sprint("%s\n", function_name);
+
+    // The challenge requires stopping at main when depth exceeds the call
+    // chain length.
+    if (strcmp(function_name, "main") == 0) break;
+    fp = *((uint64*)(fp - 16));
+  }
 }
 
 //

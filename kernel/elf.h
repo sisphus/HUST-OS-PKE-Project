@@ -37,6 +37,33 @@ typedef struct elf_prog_header_t {
   uint64 align;  /* Segment alignment */
 } elf_prog_header;
 
+// Section header and symbol structures used by the user backtrace challenge.
+typedef struct elf_section_header_t {
+  uint32 name;       /* Section name, an offset in .shstrtab */
+  uint32 type;       /* Section type */
+  uint64 flags;      /* Section flags */
+  uint64 addr;       /* Section virtual address */
+  uint64 offset;     /* Section file offset */
+  uint64 size;       /* Section size */
+  uint32 link;       /* Related section index */
+  uint32 info;       /* Section-specific information */
+  uint64 addralign;  /* Section alignment */
+  uint64 entsize;    /* Section entry size */
+} elf_section_header;
+
+typedef struct elf_symbol_t {
+  uint32 name;       /* Symbol name, an offset in the linked string table */
+  uint8 info;        /* Symbol type and binding */
+  uint8 other;       /* Symbol visibility */
+  uint16 shndx;      /* Section index */
+  uint64 value;      /* Symbol value, function start address */
+  uint64 size;       /* Symbol size */
+} elf_symbol;
+
+#define ELF_SHT_SYMTAB 2
+#define ELF_STT_FUNC 2
+#define ELF_SHN_UNDEF 0
+
 #define ELF_MAGIC 0x464C457FU  // "\x7FELF" in little endian
 #define ELF_PROG_LOAD 1
 
@@ -59,5 +86,7 @@ elf_status elf_init(elf_ctx *ctx, void *info);
 elf_status elf_load(elf_ctx *ctx);
 
 void load_bincode_from_host_elf(process *p);
+
+int elf_lookup_symbol(uint64 addr, char* name, size_t name_size);
 
 #endif

@@ -8,6 +8,9 @@
 #include "riscv.h"
 #include "spike_interface/spike_utils.h"
 
+static spike_file_t* g_user_elf_file;
+static elf_header g_user_elf_header;
+
 typedef struct elf_info_t {
   spike_file_t *f;
   process *p;
@@ -30,6 +33,82 @@ static uint64 elf_fpread(elf_ctx *ctx, void *dest, uint64 nb, uint64 offset) {
   // spike_file_pread will read the elf file (msg->f) from offset to memory (indicated by
   // *dest) for nb bytes.
   return spike_file_pread(msg->f, dest, nb, offset);
+}
+
+static int elf_read_bytes(void* dest, uint64 nb, uint64 offset) {
+  if (!g_user_elf_file) return 0;
+  return spike_file_pread(g_user_elf_file, dest, nb, offset) == (ssize_t)nb;
+}
+
+static int elf_read_section_header(uint16 index, elf_section_header* section) {
+  if (index >= g_user_elf_header.shnum || g_user_elf_header.shentsize < sizeof(*section))
+    return 0;
+
+  uint64 offset = g_user_elf_header.shoff + (uint64)index * g_user_elf_header.shentsize;
+  return elf_read_bytes(section, sizeof(*section), offset);
+}
+
+static int elf_read_string(const elf_section_header* string_section, uint32 string_offset,
+                           char* dest, size_t dest_size) {
+  if (dest_size == 0 || (uint64)string_offset >= string_section->size) return 0;
+
+  uint64 available = string_section->size - string_offset;
+  size_t read_size = available < dest_size ? available : dest_size;
+  if (!elf_read_bytes(dest, read_size, string_section->offset + string_offset)) return 0;
+
+  for (size_t i = 0; i < read_size; i++) {
+    if (dest[i] == '\0') return 1;
+  }
+
+  dest[dest_size - 1] = '\0';
+  return 1;
+}
+
+int elf_lookup_symbol(uint64 addr, char* name, size_t name_size) {
+  if (!g_user_elf_file || name_size == 0 || g_user_elf_header.shstrndx >= g_user_elf_header.shnum)
+    return 0;
+
+  elf_section_header section_name_table;
+  if (!elf_read_section_header(g_user_elf_header.shstrndx, &section_name_table)) return 0;
+
+  elf_section_header symbol_table;
+  int found_symbol_table = 0;
+  for (uint16 i = 0; i < g_user_elf_header.shnum; i++) {
+    elf_section_header section;
+    char section_name[32];
+    if (!elf_read_section_header(i, &section) ||
+        !elf_read_string(&section_name_table, section.name, section_name, sizeof(section_name)))
+      continue;
+
+    if (section.type == ELF_SHT_SYMTAB && strcmp(section_name, ".symtab") == 0) {
+      symbol_table = section;
+      found_symbol_table = 1;
+      break;
+    }
+  }
+
+  if (!found_symbol_table || symbol_table.link >= g_user_elf_header.shnum ||
+      symbol_table.entsize < sizeof(elf_symbol))
+    return 0;
+
+  elf_section_header string_table;
+  if (!elf_read_section_header(symbol_table.link, &string_table)) return 0;
+
+  uint64 symbol_count = symbol_table.size / symbol_table.entsize;
+  for (uint64 i = 0; i < symbol_count; i++) {
+    elf_symbol symbol;
+    uint64 offset = symbol_table.offset + i * symbol_table.entsize;
+    if (!elf_read_bytes(&symbol, sizeof(symbol), offset)) return 0;
+
+    uint8 symbol_type = symbol.info & 0xf;
+    if (symbol_type != ELF_STT_FUNC || symbol.shndx == ELF_SHN_UNDEF || symbol.size == 0)
+      continue;
+
+    if (symbol.value <= addr && addr - symbol.value < symbol.size)
+      return elf_read_string(&string_table, symbol.name, name, name_size);
+  }
+
+  return 0;
 }
 
 //
@@ -127,14 +206,16 @@ void load_bincode_from_host_elf(process *p) {
   if (elf_init(&elfloader, &info) != EL_OK)
     panic("fail to init elfloader.\n");
 
+  g_user_elf_file = info.f;
+  g_user_elf_header = elfloader.ehdr;
+
   // load elf. elf_load() is defined above.
   if (elf_load(&elfloader) != EL_OK) panic("Fail on loading elf.\n");
 
   // entry (virtual, also physical in lab1_x) address
   p->trapframe->epc = elfloader.ehdr.entry;
 
-  // close the host spike file
-  spike_file_close( info.f );
+  // Keep the host ELF open because the backtrace challenge reads its symbols.
 
   sprint("Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
 }

@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "string.h"
 #include "process.h"
+#include "strap.h"
 #include "util/functions.h"
 
 #include "spike_interface/spike_utils.h"
@@ -41,6 +42,9 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
       return sys_user_print((const char*)a1, a2);
     case SYS_user_exit:
       return sys_user_exit(a1);
+    case SYS_user_print_backtrace:
+      handle_print_backtrace(a1);
+      return 0;
     default:
       panic("Unknown syscall %ld \n", a0);
   }
