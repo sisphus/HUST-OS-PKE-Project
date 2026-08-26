@@ -5,6 +5,7 @@
 #include "util/types.h"
 #include "kernel/riscv.h"
 #include "kernel/config.h"
+#include "kernel/sync_utils.h"
 #include "spike_interface/spike_utils.h"
 
 //
@@ -26,9 +27,12 @@ extern void mtrapvec();
 extern uint64 htif;
 // g_mem_size is defined in spike_interface/spike_memory.c, size of the emulated memory
 extern uint64 g_mem_size;
-// struct riscv_regs is define in kernel/riscv.h, and g_itrframe is used to save
-// registers when interrupt hapens in M mode. added @lab1_2
-riscv_regs g_itrframe;
+// struct riscv_regs is defined in kernel/riscv.h. Each hart needs its own
+// M-mode interrupt frame because mtrapvec saves registers through mscratch.
+__attribute__((aligned(16))) riscv_regs g_itrframe[NCPU];
+
+// One-shot barrier for the shared HTIF/DTB initialization phase.
+static volatile int boot_count = 0;
 
 //
 // get the information of HTIF (calling interface) and the emulated memory by
@@ -91,18 +95,25 @@ void timerinit(uintptr_t hartid) {
 // m_start: machine mode C entry point.
 //
 void m_start(uintptr_t hartid, uintptr_t dtb) {
-  // init the spike file interface (stdin,stdout,stderr)
-  // functions with "spike_" prefix are all defined in codes under spike_interface/,
-  // sprint is also defined in spike_interface/spike_utils.c
-  spike_file_init();
+  assert(hartid < NCPU);
+  // tp is available in S-mode, while mhartid is an M-mode CSR.
+  write_tp(hartid);
+
+  // HTIF and DTB describe shared host/emulator state, so initialize them once.
+  if (hartid == 0) {
+    // init the spike file interface (stdin,stdout,stderr)
+    spike_file_init();
+    // init HTIF (Host-Target InterFace) and memory by using the DTB
+    init_dtb(dtb);
+  }
+
+  // Do not let any hart use the shared HTIF state before hart0 finishes.
+  sync_barrier(&boot_count, NCPU);
+
   sprint("In m_start, hartid:%d\n", hartid);
 
-  // init HTIF (Host-Target InterFace) and memory by using the Device Table Blob (DTB)
-  // init_dtb() is defined above.
-  init_dtb(dtb);
-
   // save the address of trap frame for interrupt in M mode to "mscratch". added @lab1_2
-  write_csr(mscratch, &g_itrframe);
+  write_csr(mscratch, &g_itrframe[hartid]);
 
   // set previous privilege mode to S (Supervisor), and will enter S mode after 'mret'
   // write_csr is a macro defined in kernel/riscv.h
