@@ -149,5 +149,6 @@ void load_bincode_from_host_elf(process *p, uint64 app_index) {
   // close the host spike file
   spike_file_close( info.f );
 
-  sprint("hartid = ?: Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
+  sprint("hartid = %ld: Application program entry point (virtual address): 0x%lx\n",
+         read_tp(), p->trapframe->epc);
 }
