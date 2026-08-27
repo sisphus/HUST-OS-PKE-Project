@@ -17,4 +17,23 @@ static inline void sync_barrier(volatile int *counter, int all) {
   }
 }
 
+static inline void spin_lock(volatile int *lock) {
+
+  int old;
+
+  do {
+    asm volatile("amoswap.w.aq %0, %2, (%1)\n"
+                 : "=r"(old)
+                 : "r"(lock), "r"(1)
+                 : "memory");
+  } while (old != 0);
+}
+
+static inline void spin_unlock(volatile int *lock) {
+  asm volatile("amoswap.w.rl zero, %1, (%0)\n"
+               :
+               : "r"(lock), "r"(0)
+               : "memory");
+}
+
 #endif
