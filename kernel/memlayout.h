@@ -14,6 +14,9 @@
 // virtual address of stack top of user process
 #define USER_STACK_TOP 0x7ffff000
 
+// maximum number of pages allowed for the user stack in lab2_challenge1
+#define USER_STACK_MAX_PAGES 20
+
 // start virtual address (4MB) of our simple heap. added @lab2_2
 #define USER_FREE_ADDRESS_START 0x00000000 + PGSIZE * 1024
 
