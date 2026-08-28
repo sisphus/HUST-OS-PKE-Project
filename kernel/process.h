@@ -89,6 +89,9 @@ typedef struct process_t {
 
   // accounting. added @lab3_3
   int tick_count;
+
+  // pid requested by a blocked wait; (uint64)-1 means any child.
+  uint64 wait_pid;
 }process;
 
 // switch to run user app

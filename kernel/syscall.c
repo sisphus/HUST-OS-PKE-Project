@@ -16,6 +16,8 @@
 
 #include "spike_interface/spike_utils.h"
 
+extern process procs[NPROC];
+
 //
 // implement the SYS_user_print syscall
 //
@@ -34,7 +36,23 @@ ssize_t sys_user_print(const char* buf, size_t n) {
 ssize_t sys_user_exit(uint64 code) {
   sprint("User exit with code:%d.\n", code);
   // reclaim the current process, and reschedule. added @lab3_1
-  free_process( current );
+  process *exiting = current;
+  process *parent = exiting->parent;
+  uint64 exiting_pid = exiting->pid;
+  free_process(exiting);
+
+  if (parent != NULL && parent->status == BLOCKED &&
+      (parent->wait_pid == (uint64)-1 || parent->wait_pid == exiting_pid)) {
+    parent->trapframe->regs.a0 = exiting_pid;
+    parent->wait_pid = (uint64)-1;
+    parent->status = READY;
+    insert_to_ready_queue(parent);
+
+    // The blocked wait consumes this zombie process slot.
+    exiting->status = FREE;
+    exiting->parent = NULL;
+  }
+
   schedule();
   return 0;
 }
@@ -93,6 +111,40 @@ ssize_t sys_user_yield() {
 }
 
 //
+// wait for a child process
+//
+ssize_t sys_user_wait(uint64 pid) {
+  if (pid != (uint64)-1 && (pid == 0 || pid >= NPROC))
+    return -1;
+
+  int has_child = 0;
+  for (int i = 0; i < NPROC; i++) {
+    process *child = &procs[i];
+    if (child->status == FREE || child->parent != current)
+      continue;
+    if (pid != (uint64)-1 && child->pid != pid)
+      continue;
+
+    has_child = 1;
+    if (child->status == ZOMBIE) {
+      uint64 child_pid = child->pid;
+      child->status = FREE;
+      child->parent = NULL;
+      return child_pid;
+    }
+  }
+
+  if (!has_child)
+    return -1;
+
+  current->wait_pid = pid;
+  current->status = BLOCKED;
+  schedule();
+
+  return -1;
+}
+
+//
 // [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
 // returns the code of success, (e.g., 0 means success, fail for otherwise)
 //
@@ -111,6 +163,8 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
       return sys_user_fork();
     case SYS_user_yield:
       return sys_user_yield();
+    case SYS_user_wait:
+      return sys_user_wait(a1);
     default:
       panic("Unknown syscall %ld \n", a0);
   }

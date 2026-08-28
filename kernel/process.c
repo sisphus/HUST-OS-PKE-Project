@@ -143,6 +143,7 @@ process* alloc_process() {
   procs[i].user_heap.heap_top = USER_FREE_ADDRESS_START;
   procs[i].user_heap.heap_bottom = USER_FREE_ADDRESS_START;
   procs[i].user_heap.free_pages_count = 0;
+  procs[i].wait_pid = (uint64)-1;
 
   // map user heap in userspace
   procs[i].mapped_info[HEAP_SEGMENT].va = USER_FREE_ADDRESS_START;
@@ -240,6 +241,24 @@ int do_fork( process* parent)
         child->mapped_info[child->total_mapped_region].seg_type = CODE_SEGMENT;
         child->total_mapped_region++;
         break;
+      case DATA_SEGMENT: {
+        uint64 data_va = parent->mapped_info[i].va;
+        uint64 parent_pa = lookup_pa(parent->pagetable, data_va);
+        if (parent_pa == 0)
+          panic("cannot find the physical page of parent's data segment.\n");
+
+        void *child_pa = alloc_page();
+        if (child_pa == 0)
+          panic("cannot allocate a physical page for child's data segment.\n");
+
+        memcpy(child_pa, (void *)parent_pa, PGSIZE);
+        user_vm_map((pagetable_t)child->pagetable, data_va, PGSIZE,
+          (uint64)child_pa, prot_to_type(PROT_READ | PROT_WRITE, 1));
+
+        child->mapped_info[child->total_mapped_region] = parent->mapped_info[i];
+        child->total_mapped_region++;
+        break;
+      }
     }
   }
 
