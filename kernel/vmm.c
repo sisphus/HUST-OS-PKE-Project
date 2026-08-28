@@ -193,8 +193,12 @@ void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
     return;
 
   uint64 pa = PTE2PA(*pte);
-  if (free)
-    free_page((void *)pa);
+  if (free) {
+    if (*pte & PTE_COW)
+      page_release((void *)pa);
+    else
+      free_page((void *)pa);
+  }
 
   *pte = 0;
 

@@ -159,6 +159,16 @@ process* alloc_process() {
 // reclaim a process. added @lab3_1
 //
 int free_process( process* proc ) {
+  // Release heap mappings now.  The rest of the process VM is kept until the
+  // process is no longer using its kernel stack, but COW heap pages must drop
+  // their sharing references when a process exits.
+  for (uint64 heap_block = proc->user_heap.heap_bottom;
+       heap_block < proc->user_heap.heap_top; heap_block += PGSIZE) {
+    pte_t *pte = page_walk(proc->pagetable, heap_block, 0);
+    if (pte != 0 && (*pte & PTE_V) != 0)
+      user_vm_unmap(proc->pagetable, heap_block, PGSIZE, 1);
+  }
+
   // we set the status to ZOMBIE, but cannot destruct its vm space immediately.
   // since proc can be current process, and its user kernel stack is currently in use!
   // but for proxy kernel, it (memory leaking) may NOT be a really serious issue,
@@ -205,17 +215,33 @@ int do_fork( process* parent)
             free_block_filter[index] = 1;
           }
 
-          // copy and map the heap blocks
-          for (uint64 heap_block = current->user_heap.heap_bottom;
-              heap_block < current->user_heap.heap_top; heap_block += PGSIZE) {
+          // Share and map the heap blocks.  The actual copy is delayed until
+          // one of the processes attempts a write.
+          for (uint64 heap_block = parent->user_heap.heap_bottom;
+              heap_block < parent->user_heap.heap_top; heap_block += PGSIZE) {
             if (free_block_filter[(heap_block - heap_bottom) / PGSIZE])  // skip free blocks
               continue;
 
-            void* child_pa = alloc_page();
-            memcpy(child_pa, (void*)lookup_pa(parent->pagetable, heap_block), PGSIZE);
-            user_vm_map((pagetable_t)child->pagetable, heap_block, PGSIZE, (uint64)child_pa,
-                        prot_to_type(PROT_WRITE | PROT_READ, 1));
+            uint64 parent_pa = lookup_pa(parent->pagetable, heap_block);
+            pte_t *parent_pte = page_walk(parent->pagetable, heap_block, 0);
+            if (parent_pa == 0 || parent_pte == 0 || (*parent_pte & PTE_V) == 0)
+              panic("cannot find parent's heap page for COW.\n");
+
+            // Both mappings must be read-only so that the first writer traps.
+            // PTE_COW records why this otherwise valid mapping is read-only.
+            uint64 cow_flags = PTE_FLAGS(*parent_pte);
+            cow_flags &= ~(PTE_W | PTE_D);
+            cow_flags |= PTE_COW;
+            *parent_pte = PA2PTE(parent_pa) | cow_flags;
+
+            user_vm_map((pagetable_t)child->pagetable, heap_block, PGSIZE,
+                        parent_pa, prot_to_type(PROT_READ, 1));
+            pte_t *child_pte = page_walk(child->pagetable, heap_block, 0);
+            *child_pte = PA2PTE(parent_pa) | cow_flags;
+            page_retain((void *)parent_pa);
           }
+
+          flush_tlb();
 
           child->mapped_info[HEAP_SEGMENT].npages = parent->mapped_info[HEAP_SEGMENT].npages;
 

@@ -7,5 +7,8 @@ void pmm_init();
 void* alloc_page();
 // Free an allocated page
 void free_page(void* pa);
+// Add/remove one mapping reference to a physical page.
+void page_retain(void *pa);
+void page_release(void *pa);
 
 #endif

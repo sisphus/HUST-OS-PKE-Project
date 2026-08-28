@@ -9,6 +9,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "sched.h"
+#include "util/string.h"
 #include "util/functions.h"
 
 #include "spike_interface/spike_utils.h"
@@ -50,20 +51,43 @@ void handle_mtimer_trap() {
 void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
   sprint("handle_page_fault: %lx\n", stval);
   switch (mcause) {
-    case CAUSE_STORE_PAGE_FAULT:
-      // TODO (lab2_3): implement the operations that solve the page fault to
-      // dynamically increase application stack.
-      // hint: first allocate a new physical page, and then, maps the new page to the
-      // virtual address that causes the page fault.
+    case CAUSE_STORE_PAGE_FAULT: {
+      uint64 fault_va = ROUNDDOWN(stval, PGSIZE);
+      pte_t *pte = page_walk((pagetable_t)current->pagetable, fault_va, 0);
+
+      if (pte != 0 && (*pte & PTE_V) != 0 && (*pte & PTE_COW) != 0) {
+        uint64 old_pa = PTE2PA(*pte);
+        void *new_pa = alloc_page();
+        if (new_pa == 0)
+          panic("cannot allocate a physical page for COW.\n");
+
+        memcpy(new_pa, (void *)old_pa, PGSIZE);
+
+        // Keep the original user permissions, make this private copy
+        // writable, and remove the software-only COW marker.
+        uint64 flags = PTE_FLAGS(*pte);
+        flags &= ~PTE_COW;
+        flags |= PTE_W | PTE_D;
+        *pte = PA2PTE(new_pa) | flags;
+
+        page_release((void *)old_pa);
+        flush_tlb();
+        break;
+      }
+
+      if (pte != 0 && (*pte & PTE_V) != 0)
+        panic("store page fault on a non-COW mapped page.\n");
+
+      // This is the original lab2_3 case: the faulting stack page has no
+      // mapping yet, so establish a new writable user page.
       void *pa = alloc_page();
       if (pa == 0)
         panic("cannot allocate a physical page for user stack.\n");
 
-      user_vm_map((pagetable_t)current->pagetable,
-                  ROUNDDOWN(stval, PGSIZE), PGSIZE, (uint64)pa,
-                  prot_to_type(PROT_READ | PROT_WRITE, 1));
-
+      user_vm_map((pagetable_t)current->pagetable, fault_va, PGSIZE,
+                  (uint64)pa, prot_to_type(PROT_READ | PROT_WRITE, 1));
       break;
+    }
     default:
       sprint("unknown page fault.\n");
       break;

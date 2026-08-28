@@ -15,6 +15,13 @@ extern uint64 g_mem_size;
 static uint64 free_mem_start_addr;  //beginning address of free memory
 static uint64 free_mem_end_addr;    //end address of free memory (not included)
 
+// A page reference count is needed when multiple user page tables share one
+// physical heap page during COW.  The managed memory is capped by
+// PKE_MAX_ALLOWABLE_RAM, so this table covers every page that alloc_page()
+// can return without consuming another managed page for metadata.
+#define MAX_MANAGED_PAGES (PKE_MAX_ALLOWABLE_RAM / PGSIZE)
+static uint32 g_page_refcounts[MAX_MANAGED_PAGES];
+
 typedef struct node {
   struct node *next;
 } list_node;
@@ -39,6 +46,8 @@ void free_page(void *pa) {
   if (((uint64)pa % PGSIZE) != 0 || (uint64)pa < free_mem_start_addr || (uint64)pa >= free_mem_end_addr)
     panic("free_page 0x%lx \n", pa);
 
+  g_page_refcounts[((uint64)pa - free_mem_start_addr) / PGSIZE] = 0;
+
   // insert a physical page to g_free_mem_list
   list_node *n = (list_node *)pa;
   n->next = g_free_mem_list.next;
@@ -53,7 +62,38 @@ void *alloc_page(void) {
   list_node *n = g_free_mem_list.next;
   if (n) g_free_mem_list.next = n->next;
 
+  if (n)
+    g_page_refcounts[((uint64)n - free_mem_start_addr) / PGSIZE] = 1;
+
   return (void *)n;
+}
+
+// Add one page-table mapping reference to a managed physical page.
+void page_retain(void *pa) {
+  if (((uint64)pa % PGSIZE) != 0 || (uint64)pa < free_mem_start_addr ||
+      (uint64)pa >= free_mem_end_addr)
+    panic("page_retain 0x%lx\n", pa);
+
+  uint32 *ref = &g_page_refcounts[((uint64)pa - free_mem_start_addr) / PGSIZE];
+  if (*ref == 0)
+    panic("page_retain on a free page 0x%lx\n", pa);
+  (*ref)++;
+}
+
+// Drop one page-table mapping reference and return the page to the free list
+// only after the last mapping disappears.
+void page_release(void *pa) {
+  if (((uint64)pa % PGSIZE) != 0 || (uint64)pa < free_mem_start_addr ||
+      (uint64)pa >= free_mem_end_addr)
+    panic("page_release 0x%lx\n", pa);
+
+  uint32 *ref = &g_page_refcounts[((uint64)pa - free_mem_start_addr) / PGSIZE];
+  if (*ref == 0)
+    panic("page_release on a free page 0x%lx\n", pa);
+
+  (*ref)--;
+  if (*ref == 0)
+    free_page(pa);
 }
 
 //
