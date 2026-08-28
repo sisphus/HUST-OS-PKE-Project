@@ -16,6 +16,21 @@
 
 #include "spike_interface/spike_utils.h"
 
+#define MAX_SEMAPHORES 16
+
+typedef struct semaphore_t {
+  int used;
+  int count;
+  process *wait_queue_head;
+  process *wait_queue_tail;
+} semaphore;
+
+static semaphore semaphores[MAX_SEMAPHORES];
+
+static int valid_semaphore(uint64 sem_id) {
+  return sem_id < MAX_SEMAPHORES && semaphores[sem_id].used;
+}
+
 //
 // implement the SYS_user_print syscall
 //
@@ -93,6 +108,78 @@ ssize_t sys_user_yield() {
 }
 
 //
+// create a semaphore and return its identifier
+//
+ssize_t sys_user_sem_new(uint64 init_value) {
+  if (init_value > 0x7fffffffUL)
+    return -1;
+
+  for (int i = 0; i < MAX_SEMAPHORES; i++) {
+    if (semaphores[i].used)
+      continue;
+
+    semaphores[i].used = 1;
+    semaphores[i].count = (int)init_value;
+    semaphores[i].wait_queue_head = NULL;
+    semaphores[i].wait_queue_tail = NULL;
+    return i;
+  }
+
+  return -1;
+}
+
+//
+// acquire a semaphore resource
+//
+ssize_t sys_user_sem_P(uint64 sem_id) {
+  if (!valid_semaphore(sem_id))
+    return -1;
+
+  semaphore *sem = &semaphores[sem_id];
+  if (sem->count > 0) {
+    sem->count--;
+    return 0;
+  }
+
+  current->status = BLOCKED;
+  current->queue_next = NULL;
+  if (sem->wait_queue_tail == NULL) {
+    sem->wait_queue_head = current;
+    sem->wait_queue_tail = current;
+  } else {
+    sem->wait_queue_tail->queue_next = current;
+    sem->wait_queue_tail = current;
+  }
+
+  schedule();
+  return 0;
+}
+
+//
+// release a semaphore resource
+//
+ssize_t sys_user_sem_V(uint64 sem_id) {
+  if (!valid_semaphore(sem_id))
+    return -1;
+
+  semaphore *sem = &semaphores[sem_id];
+  if (sem->wait_queue_head == NULL) {
+    sem->count++;
+    return 0;
+  }
+
+  process *woken = sem->wait_queue_head;
+  sem->wait_queue_head = woken->queue_next;
+  if (sem->wait_queue_head == NULL)
+    sem->wait_queue_tail = NULL;
+  woken->queue_next = NULL;
+  woken->status = READY;
+  woken->trapframe->regs.a0 = 0;
+  insert_to_ready_queue(woken);
+  return 0;
+}
+
+//
 // [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
 // returns the code of success, (e.g., 0 means success, fail for otherwise)
 //
@@ -111,6 +198,12 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
       return sys_user_fork();
     case SYS_user_yield:
       return sys_user_yield();
+    case SYS_user_sem_new:
+      return sys_user_sem_new(a1);
+    case SYS_user_sem_P:
+      return sys_user_sem_P(a1);
+    case SYS_user_sem_V:
+      return sys_user_sem_V(a1);
     default:
       panic("Unknown syscall %ld \n", a0);
   }
