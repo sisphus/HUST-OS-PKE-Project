@@ -1,0 +1,204 @@
+{
+  "baseline": "c30acbe",
+  "chapters": [
+    {
+      "baseline_counts": {
+        "anchors": 8,
+        "fenced_code_blocks": 12,
+        "headings": 8,
+        "images": 10,
+        "links": 15,
+        "required_headings": 7,
+        "urls": 9
+      },
+      "chapter": 1,
+      "current_counts": {
+        "anchors": 8,
+        "fenced_code_blocks": 12,
+        "headings": 8,
+        "images": 10,
+        "links": 15,
+        "required_headings": 7,
+        "urls": 9
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter1_riscv.md",
+      "unresolved_local_targets": []
+    },
+    {
+      "baseline_counts": {
+        "anchors": 7,
+        "fenced_code_blocks": 5,
+        "headings": 11,
+        "images": 7,
+        "links": 25,
+        "required_headings": 7,
+        "urls": 12
+      },
+      "chapter": 2,
+      "current_counts": {
+        "anchors": 7,
+        "fenced_code_blocks": 5,
+        "headings": 11,
+        "images": 7,
+        "links": 25,
+        "required_headings": 7,
+        "urls": 12
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter2_installation.md",
+      "unresolved_local_targets": []
+    },
+    {
+      "baseline_counts": {
+        "anchors": 31,
+        "fenced_code_blocks": 67,
+        "headings": 39,
+        "images": 3,
+        "links": 62,
+        "required_headings": 26,
+        "urls": 18
+      },
+      "chapter": 3,
+      "current_counts": {
+        "anchors": 31,
+        "fenced_code_blocks": 67,
+        "headings": 39,
+        "images": 3,
+        "links": 62,
+        "required_headings": 26,
+        "urls": 18
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter3_traps.md",
+      "unresolved_local_targets": []
+    },
+    {
+      "baseline_counts": {
+        "anchors": 29,
+        "fenced_code_blocks": 36,
+        "headings": 39,
+        "images": 5,
+        "links": 51,
+        "required_headings": 24,
+        "urls": 12
+      },
+      "chapter": 4,
+      "current_counts": {
+        "anchors": 29,
+        "fenced_code_blocks": 36,
+        "headings": 39,
+        "images": 5,
+        "links": 51,
+        "required_headings": 24,
+        "urls": 12
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter4_memory.md",
+      "unresolved_local_targets": []
+    },
+    {
+      "baseline_counts": {
+        "anchors": 28,
+        "fenced_code_blocks": 39,
+        "headings": 36,
+        "images": 0,
+        "links": 46,
+        "required_headings": 23,
+        "urls": 12
+      },
+      "chapter": 5,
+      "current_counts": {
+        "anchors": 28,
+        "fenced_code_blocks": 39,
+        "headings": 36,
+        "images": 0,
+        "links": 46,
+        "required_headings": 23,
+        "urls": 12
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter5_process.md",
+      "unresolved_local_targets": []
+    },
+    {
+      "baseline_counts": {
+        "anchors": 33,
+        "fenced_code_blocks": 68,
+        "headings": 49,
+        "images": 7,
+        "links": 52,
+        "required_headings": 35,
+        "urls": 12
+      },
+      "chapter": 6,
+      "current_counts": {
+        "anchors": 33,
+        "fenced_code_blocks": 68,
+        "headings": 49,
+        "images": 7,
+        "links": 52,
+        "required_headings": 35,
+        "urls": 12
+      },
+      "errors": [],
+      "missing": {
+        "anchors": [],
+        "fenced_code_blocks": [],
+        "images": [],
+        "links": [],
+        "required_headings": [],
+        "urls": []
+      },
+      "passed": true,
+      "path": "docs/pke-doc-master 2/chapter6_filesystem.md",
+      "unresolved_local_targets": []
+    }
+  ],
+  "passed": true
+}
