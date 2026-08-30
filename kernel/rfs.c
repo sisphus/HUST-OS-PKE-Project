@@ -484,15 +484,12 @@ struct vinode *rfs_create(struct vinode *parent, struct dentry *sub_dentry) {
 
   // initialize the states of the file being created
 
-  // TODO (lab4_1): implement the code for populating the disk inode (free_dinode) 
-  // of a new file being created.
-  // hint:  members of free_dinode to be filled are:
-  // size, should be zero for a new file.
-  // type, see kernel/rfs.h and find the type for a rfs file.
-  // nlinks, i.e., the number of links.
-  // blocks, i.e., its block count.
-  // Note: DO NOT DELETE CODE BELOW PANIC.
-  panic("You need to implement the code of populating a disk inode in lab4_1.\n" );
+  // A newly created regular file is empty, has one directory link, and
+  // reserves the first data block below before its inode is written back.
+  free_dinode->size = 0;
+  free_dinode->type = R_FILE;
+  free_dinode->nlinks = 1;
+  free_dinode->blocks = 1;
 
   // DO NOT REMOVE ANY CODE BELOW.
   // allocate a free block for the file
