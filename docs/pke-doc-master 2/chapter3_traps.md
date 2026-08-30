@@ -1,5 +1,43 @@
 # 第三章．实验1：系统调用、异常和外部中断
 
+> 本章只围绕一个核心问题展开：**CPU 为什么离开当前指令流，进入 PKE 的 handler，又怎样带着正确的寄存器和 PC 返回？** 系统调用、异常和外部中断都使用 trap 机制，但触发源、处理语义和返回规则不同。不要因为它们进入了同一个入口，就把它们当成同一件事。
+
+#### 本章前置知识
+
+- 会按第 1 章的方法阅读 `a0`、`sp`、`ra`、`tp` 等寄存器；
+- 知道 M/S/U 三种特权模式和 `xepc`、`xcause`、`xtval` 的基本角色；
+- 能区分“函数调用返回”与“trap 返回”；
+- 环境已经能构建 PKE，并能用 Spike 运行给定应用。
+
+#### 本章学习路线
+
+1. 先用 3.1 串起“源文件—ELF—PKE 启动—应用装载—HTIF 输出”；
+2. 在 lab1_1 中理解 U-mode `ecall` 到 S-mode 系统调用再返回；
+3. 在 lab1_2 中比较非法指令异常，重点判断 `sepc` 是否前移；
+4. 在 lab1_3 中比较异步定时器中断，理解 pending 位和下一次触发点；
+5. 三个挑战分别把 trap 上下文用于调用栈、源码定位和多 hart 运行。
+
+#### 统一的 trap 事件记录
+
+后面每个 Lab 都先填写这张表：
+
+| 问题 | 系统调用示例 | 非法指令示例 | 定时器示例 |
+| --- | --- | --- | --- |
+| 谁触发 | U-mode 执行 `ecall` | U-mode 执行非法/越权指令 | 定时器到达比较点 |
+| 同步或异步 | 同步 | 同步 | 异步 |
+| 主要原因字段 | `scause` | `scause`，有时结合 `stval` | `scause` 与 pending 位 |
+| handler 做什么 | 分派 syscall、写返回值 | 报错、修复或终止 | 清 pending、设置下一次触发 |
+| 返回 PC | 越过 `ecall` | 取决于是否可修复；不能盲目重试 | 回到被打断位置 |
+
+#### 学完后你应该能回答
+
+- `mepc/sepc` 与普通通用寄存器分别由谁保存？
+- 为什么系统调用返回值必须写进 trapframe 中保存的 `a0`？
+- 为什么非法指令不能直接交给 `do_syscall()`？
+- 为什么错误的 PC 处理会形成异常循环？
+- 清除 `SIP_STIP` 与重新设置定时器触发点分别解决什么问题？
+- 多 hart 下哪些状态必须按 hart 分开，哪些初始化必须只做一次？
+
 
 ### 目录  
 - [3.1 实验1的基础知识](#fundamental)  
@@ -39,11 +77,34 @@
 
 ## 3.1 实验1的基础知识
 
+#### 先串起完整启动链
+
+不要把编译、链接、启动、装载和 trap 当成五段无关知识。PKE 的实际因果链是：
+
+1. 编译器/汇编器把内核和应用源文件变成目标文件；
+2. 链接器按各自链接脚本生成 PKE ELF 和用户应用 ELF；
+3. Spike 装入 PKE，hart 从 machine entry 开始执行；
+4. M-mode 初始化平台状态，再进入 S-mode 内核；
+5. PKE 解析用户 ELF，把段装入用户地址空间，准备 trapframe；
+6. `return_to_user()` 恢复用户寄存器并进入 U-mode；
+7. 应用执行 `ecall`、非法指令或被中断，控制流再经 trap 入口回到内核；
+8. PKE 需要输出、文件或关机服务时，通过 HTIF 与 Spike/host 通信。
+
+后面 3.1.1–3.1.6 分别放大这条链中的一个阶段。判断一个地址或符号时，先说明它属于哪个 ELF、哪个地址空间和哪个时刻。
+
 本章我们将首先[获得代码](#subsec_preparecode)，接下来介绍[程序的编译链接和ELF文件](#subsec_elfload)的基础知识，接着讲述riscv-pke操作系统内核的[启动原理](#subsec_booting)，最后开始实验1的3个实验。
 
 <a name="subsec_compileandlink"></a>
 
 ### 3.1.1 RISC-V程序的编译和链接
+
+#### 心智模型：目标文件还不是最终运行布局
+
+编译阶段决定“每个函数和数据生成什么机器码与重定位信息”，链接阶段决定“这些段和符号最终放到什么逻辑地址”。同名函数在目标文件中的局部偏移，不能直接当作运行时地址；必须结合链接脚本和最终 ELF。
+
+阅读 Makefile 时沿依赖方向走：源文件生成 `.o`，多个 `.o` 归档或链接，最后分别生成 `obj/riscv-pke` 和用户应用。阅读链接脚本时则沿地址方向走：入口符号、段顺序、对齐和起始地址共同确定布局。
+
+**边界提醒：**内核 ELF 和应用 ELF 是两个独立链接产物。它们都可能有 `main` 或相似段名，但装载者、运行特权级和地址空间不同。
 
 下面，我们将简要介绍RISC-V程序的编译和链接相关知识。这里，我们仍然假设你已经按照[第二章](chapter2_installation.md)的要求完成了基于Ubuntu或者openEular的开发环境构建，如果是在头歌平台，可以通过他们提供的交互??进入终端使用（里面的交叉编译器已经安装且已加入系统路径）。在PKE实验的开发环境中，我们通过模拟器（spike）所构建的目标机是risc-v机器，而主机一般采用的是采用x86指令集的Intel处理器（openEular可能采用的是基于ARM指令集的华为鲲鹏处理器），在这种配置下我们的程序，包括PKE操作系统内核以及应用都通过交叉编译器所提供的工具进行编译和链接。虽然risc-v交叉编译器和主机环境下的GCC是同一套体系，但它的使用和输出还是有些细微的不同，所以有必要对它进行一定的了解。
 
@@ -246,6 +307,14 @@ Disassembly of section .text:
 
 ### 3.1.2 指定符号的逻辑地址
 
+#### 问题：函数名怎样变成可跳转的地址
+
+符号表把名字映射到地址和大小。对一个函数符号，`st_value` 通常给出函数起始逻辑地址，`st_size` 给出范围，`st_name` 则是该名字在字符串表中的偏移。因而“某 PC 是否落在函数内”可以判断为：起始地址不大于 PC，且 PC 小于起始地址加大小。
+
+例如函数从 `0x1000` 开始，目标位置是函数内偏移 20，那么对应逻辑地址是 `0x1000 + 20`。这里的 20 是字节偏移，不是“第 20 条 C 语句”。
+
+**常见混淆：**`.shstrtab` 保存 section 名（如 `.symtab`、`.strtab`），`.strtab` 保存符号名（如 `main`、`f8`）。先找到正确 section，再用其字符串表解释名称偏移。
+
 编译器在链接过程中，一个重要的任务就是为源程序中的符号（symbol）赋予逻辑地址。例如，在以上`sections`的例子中，我们通过`objdump`命令，得知helloworld.c源文件的main函数所对应的逻辑地址为0x000000000001014e，而且对于任意ELF中的段（segment）或节（section）而言，它的逻辑地址必然是从某个地址开始的一段连续地址空间。
 
 那么，是否有办法指定某符号对应的逻辑地址呢？答案是可以，但只能指定符号所在的段的起始逻辑地址，方法是通过lds链接脚本。我们还是用以上的helloworld.c作为例子，另外创建和编辑一个lds链接脚本，即helloworld_lds.lds文件：
@@ -345,6 +414,12 @@ Disassembly of section .text:
 <a name="subsec_building"></a>
 
 ### 3.1.3 代理内核的构造过程
+
+#### 从构建输出反推产物
+
+代理内核不是单个 C 文件编译出来的。通用工具、Spike 接口、内核 C 代码、machine/supervisor trap 汇编入口和链接脚本共同形成最终 ELF。任何一层缺失都可能在链接前后以不同形式报错。
+
+阅读下面的构造过程时，给每个输入标记角色：普通 C 逻辑、特权级入口汇编、平台接口、公共库或布局规则。这样后面看到一个函数时，能判断它是在 host 上提供服务，还是作为 RISC-V 机器码进入最终内核。
 
 这里我们讨论lab1_1中代理内核，以及其上运行的应用的构造（build）过程。PKE实验采用了Linux中广泛采用的make软件包完成内核、支撑库，以及应用的构造。关于Makefile的编写，我们建议读者阅读[这里](https://blog.csdn.net/foryourface/article/details/34058577)了解make文件的基础知识，这里仅讨论lab1_1的Makefile以及对应的构造过程。PKE的后续实验实际上采用的Makefile跟lab1_1的非常类似，所以我们在后续章节中不再对它们的构建过程进行讨论。
 
@@ -478,6 +553,20 @@ Disassembly of section .text:
 <a name="subsec_booting"></a>
 
 ### 3.1.4 代理内核的启动过程
+
+#### 用“当前模式 + 参数 + 栈”追踪启动
+
+Spike 启动 hart 时把 hart 编号放入 `a0`、设备树地址放入 `a1`。入口代码读取 `mhartid`，为当前 hart 选择 machine stack，然后调用 C 函数 `m_start`；只要中途没有覆盖，`a0/a1` 就继续符合 C ABI 的前两个参数位置。
+
+启动过程中的每一次模式切换都要回答：
+
+1. 当前是 M/S/U 哪个模式；
+2. `mepc/sepc` 指向返回后的哪条指令；
+3. `mstatus/sstatus` 中的返回模式字段是什么；
+4. 当前 `sp` 属于 machine 栈、kernel 栈还是 user 栈；
+5. trap 向量与 scratch 寄存器是否已经指向当前 hart 的上下文。
+
+**常见错误：**只看 C 函数名而忽略入口汇编。模式转换、初始栈和参数传递往往发生在 `.S` 文件里。
 
 
 在3.1.1中，我们获取riscv-pke的代码并完成构造步骤后，我们将通过以下命令开始lab1_1所给定的应用的执行：
@@ -761,6 +850,17 @@ s_start函数在kernel/kernel.c文件中定义：
 
 ### 3.1.5 ELF文件（app）的加载过程
 
+#### 装载器只关心运行需要的段
+
+应用 ELF 同时包含运行信息和调试/链接信息。装载时，PKE 读取 program header，给需要装入的段分配并建立用户映射，把文件内容复制到指定虚拟地址，再准备用户栈和入口 PC。section header 中的符号表、字符串表和调试行信息则主要服务于分析与调试。
+
+因此要区分两个问题：
+
+- “这个应用怎样跑起来？”看可装载段、虚拟地址、文件大小/内存大小和权限；
+- “这个 PC 属于哪个函数或源码行？”看 `.symtab`、`.strtab` 和调试信息。
+
+装载完成不代表应用已经执行；只有 trapframe 中的入口、用户栈和必要寄存器准备好，并通过返回路径切换到 U-mode 后，第一条用户指令才真正运行。
+
 这里我们对load_user_program()函数进行讨论，它在kernel/kernel.c中定义：
 
 ```c
@@ -874,6 +974,12 @@ s_start函数在kernel/kernel.c文件中定义：
 
 ### 3.1.6 spike的HTIF接口
 
+#### HTIF 是 PKE 与模拟器宿主之间的通道
+
+PKE 在 Spike 中没有直接控制真实磁盘或终端，它通过 HTIF 发出请求，由 Spike/host 完成输出、文件访问或关机等操作。`frontend_syscall()` 内部的锁只能保证单次 HTIF 请求不并发冲突，不能自动保证全局初始化只执行一次，也不能替代多 hart 启动屏障。
+
+**边界提醒：**HTIF 锁保护的是请求临界区；`spike_file_init()`、`init_dtb()` 等共享初始化仍需明确由一个 hart 执行，其他 hart 在 barrier 后才能使用结果。关闭 Spike 是全局行为，也必须由明确的 hart 在所有工作完成后执行。
+
 spike提供的HTIF（Host-Target InterFace）接口的原理可以用下图说明：
 
 <img src="pictures/htif.png" alt="fig2_install_1" style="zoom:100%;" />
@@ -893,6 +999,26 @@ spike基于HTIF内存的传递，定义了一组HTIF调用（类似于操作系�
 <a name="syscall"></a>
 
 ## 3.2 lab1_1 系统调用（[头歌实验链接](https://www.educoder.net/shixuns/lawkz324/challenges)）
+
+#### 先看当前行为与目标行为
+
+给定应用在 U-mode 调用用户库，用户库把系统调用号和参数放入 ABI 约定的寄存器并执行 `ecall`。当前内核能进入系统调用路径，但 TODO 处没有把 handler 的返回值写回保存的用户上下文，应用因而无法可靠得到返回结果。目标是完成一次闭环：**请求进入内核、分派、得到返回值、写回 trapframe、越过 `ecall`、恢复到用户态**。
+
+#### 端到端调用链
+
+`用户函数 → user_lib 中的 syscall 包装 → ecall → S-mode trap 入口 → 保存通用寄存器到 trapframe → do_syscall() → 具体 syscall → trapframe->regs.a0 = 返回值 → sepc 前移 → return_to_user()`
+
+这里有两个不同的 `a0` 时刻：进入系统调用前，它可能保存第一个参数；系统调用结束后，ABI 规定它保存返回值。若只把结果留在 S-mode C 函数的局部变量 `rc` 中，trap 出口会按 trapframe 恢复旧的用户 `a0`，新结果就丢失了。`rc` 在赋值前也可能仍是系统调用号等旧值，因此必须明确接收 `do_syscall()` 的结果。
+
+#### 实现时逐项检查
+
+1. 从 trapframe 读取系统调用号和参数；
+2. 让 `rc` 接住 `do_syscall()` 的返回值；
+3. 把 `rc` 写入 `tf->regs.a0`；
+4. 按指令长度让保存的 PC 越过 `ecall`；
+5. 运行给定 Hello World 应用验证完整返回路径。
+
+即使当前 `Hello world!` 表面上不使用返回值，handler 仍应按系统调用 ABI 正确写回；实验目标是实现通用边界，而不是只让一个输出碰巧出现。
 
 <a name="lab1_1_app"></a>
 
@@ -1126,6 +1252,22 @@ $ git commit -a -m "my work on lab1_1 is done."
 
 ## 3.3 lab1_2 异常处理（[头歌实验链接](https://www.educoder.net/shixuns/tznof6hx/challenges)）
 
+#### 先判断：这不是系统调用
+
+本 Lab 的 U-mode 程序执行 machine code 中的非法或越权指令。U-mode 执行普通 `addi` 没问题，错误来自指令权限/编码本身，而不是使用了某个通用寄存器。CPU 产生非法指令异常，S-mode handler 必须按 `scause` 分派到异常路径。
+
+#### 端到端调用链
+
+`U-mode 非法指令 → 硬件写 sepc/scause/stval → S-mode trap 入口 → 保存 trapframe → 异常分派 → 报告或处理 → 决定是否返回`
+
+不要把 TODO 中的 `panic` 机械替换为 S-mode `do_syscall()`。`do_syscall()` 只处理 U-mode 执行 `ecall` 产生的系统调用；这里的触发指令、cause 和语义都不同。
+
+#### 为什么 PC 规则决定是否死循环
+
+如果 handler 返回后仍保持原 `sepc`，CPU 会重新执行同一条非法指令，再次触发异常，形成循环。只有当内核明确模拟或跳过该指令时才能前移；若异常不可恢复，更合理的行为是终止/报告，而不是假装它是 syscall。
+
+调试时同时记录 `a0`、`mscratch/sscratch` 和 trapframe 指针，区分“进入 trap 前的用户值”“入口汇编暂存值”和“C handler 看到的上下文”，不要仅凭某一时刻的寄存器截图推断完整流程。
+
 <a name="lab1_2_app"></a>
 
 #### **给定应用**
@@ -1333,6 +1475,24 @@ $ git commit -a -m "my work on lab1_2 is done."
 <a name="irq"></a>
 
 ## 3.4 lab1_3 （外部）中断 （[头歌实验链接](https://www.educoder.net/shixuns/wp4ys5ag/challenges)）
+
+#### 与前两个 Lab 的关键区别
+
+定时器中断是异步事件：它不表示当前指令有错，也不是应用主动请求服务。返回时通常要继续被打断的指令流，所以不能像 `ecall` 那样固定把 `sepc` 加 4。
+
+#### 端到端调用链
+
+`每 hart 的定时器到期 → machine timer 处理/转发 → S-mode pending 位 SIP_STIP 置位 → S-mode trap 入口 → timer handler → 清 pending → 设置下一次触发点 → 返回原执行流`
+
+清除 `SIP_STIP` 是对这次 S-mode timer pending 状态的正确应答；若 pending 一直保持，返回后会立刻再次进入中断。只清 pending 但不安排下一次 timer，则不会形成周期性 tick。两步解决的是不同问题。
+
+#### 实现时逐项检查
+
+1. 用 cause 的 interrupt 位和编号确认这是 timer，而非异常；
+2. 清除正确的 pending 位，不覆盖其他 CSR 位；
+3. 为当前 hart 设置下一次定时器触发点；
+4. 保持 trapframe 中被打断程序的 PC；
+5. 观察 tick 持续发生且应用仍能推进。
 
 <a name="lab1_3_app"></a>
 
@@ -1632,6 +1792,23 @@ $ git commit -a -m "my work on lab1_3 is done."
 
 ## 3.5 lab1_challenge1 打印用户程序调用栈（难度：&#9733;&#9733;&#9733;&#9734;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/9i8lur4h/challenges)）
 
+#### 问题：进入内核后，当前 `sp` 已经不是用户栈
+
+trap 入口为了安全处理异常会切到内核栈，所以在 S-mode C handler 中直接从当前 `sp` 回溯，得到的是内核调用链。用户程序被打断时的 `sp` 和 `s0/fp` 已保存在 `current->trapframe->regs.sp` 与 `current->trapframe->regs.s0`，用户栈回溯必须从那里开始。
+
+#### 栈帧回溯的最小循环
+
+对当前 frame pointer：
+
+1. 从当前 `fp` 附近找到编译器保存的 `ra`；
+2. 读取保存的旧 `fp`；
+3. 用旧 `fp` 进入上一层栈帧；
+4. 检查地址范围和终止条件，避免坏指针造成内核再次 fault。
+
+得到返回地址后还只有 PC。要打印函数名，需要解析应用 ELF 的 `.symtab` 和 `.strtab`：用 `st_value` 与 `st_size` 判断 PC 落在哪个函数范围，再用 `st_name` 从字符串表取名字。
+
+**验证重点：**输出顺序应与给定应用的调用关系一致；进入 trap 后的内核函数不应混入用户调用栈。
+
 <a name="lab1_challenge1_app"></a>
 
 #### **给定应用**
@@ -1813,6 +1990,20 @@ uint64 elf_fpread(elf_ctx *ctx, void *dest, uint64 nb, uint64 offset)
 
 ## 3.6 lab1_challenge2 打印异常代码行（难度：&#9733;&#9733;&#9733;&#9734;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/5apy6ojf/challenges)）
 
+#### 从异常 PC 到源码行要经过三次映射
+
+1. `mepc/sepc` 给出发生异常的机器指令地址；
+2. ELF 调试行表把地址区间映射到源文件名和行号，例如 line 10；
+3. PKE 再通过 host 文件接口打开对应源文件，读取并打印那一行文本。
+
+符号表只能回答“属于哪个函数”，不能单独回答“第几行”。源码行信息通常来自编译时生成的 debug section；而真正打印源码文本，还要能访问源文件内容。
+
+#### 文件对象不要混淆
+
+沿实现追踪时分别记录进程文件表项、其中的 file/dir 信息以及目录索引，例如 `p->file[2].file`、`p->file[2].dir`、`p->dir[dir_index]`。它们描述的是运行时打开对象，不等同于 ELF 中的 section 表。
+
+**验证重点：**故意触发异常后，输出的文件、行号和源码文本必须一致；不能只打印一个硬编码行号，也不能把 `mepc` 本身当作文件偏移。
+
 <a name="lab1_challenge2_app"></a>
 
 #### **给定应用**
@@ -1899,6 +2090,32 @@ $ git merge lab1_3_irq -m "continue to work on lab1_challenge1"
 <a name="lab1_challenge3_multicore"></a>
 
 ## 3.7 lab1_challenge3 多核启动及运行（难度：&#9733;&#9733;&#9733;&#9733;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/2znkcmh9/challenges)）
+
+#### 先把“共享一次”和“每 hart 一份”分开
+
+多 hart 不是把单核初始化函数调用两次那么简单。状态分为三类：
+
+| 类别 | 例子 | 规则 |
+| --- | --- | --- |
+| 全局只初始化一次 | `spike_file_init()`、`init_dtb()` 等共享资源 | hart0 完成，其他 hart 过 boot barrier 后使用 |
+| 每 hart 独立 | machine stack、kernel stack、user stack、trapframe、timer、当前进程、tick | 按 `hartid` 选择数组元素并分别初始化 |
+| 全局完成一次 | Spike shutdown | 等所有 hart 结束后，由明确的一个 hart 执行 |
+
+#### 启动参数和 hart 身份
+
+Spike 把 hart 编号放入 `a0`、设备树地址放入 `a1`；入口还可以读取 `mhartid`，为每个 hart 计算独立 machine stack。进入用户态前，把 `trapframe->regs.tp = hartid`，这样 `return_to_user()` 恢复包括 `tp` 在内的寄存器后，用户代码可以用 `read_tp()` 找到当前 hart。应用选择使用 `argv[hartid]`。
+
+每个 hart 还需要自己的 `USER_STACK`、`USER_KSTACK`、`USER_TRAP_FRAME`，以及按 hart 分开的 `current`、`g_itrframe[]`、`g_ticks[]` 等运行时状态。否则一个 hart 保存 trap 上下文时会覆盖另一个 hart。
+
+#### 两个 barrier 不能复用只增不减的同一计数
+
+启动同步和退出同步是两次不同事件。若计数器只递增、不自动清零，复用同一个值会让第二个 barrier 的条件提前成立。应使用不同计数器，或实现带代次的可复用 barrier。
+
+每个 hart 都要调用 `timerinit()` 设置自己的触发点；只让 hart0 初始化，hart1 不会自动拥有定时器。`switch_to()` 修改的 `stvec`、`sstatus`、`sepc`、`sscratch` 等 CSR 是每 hart 独立的，不会直接覆盖另一 hart，但传入的数据地址仍必须选择当前 hart 的数组元素。
+
+#### 正确退出顺序
+
+如果 hart0 先结束就立即 shutdown，hart1 可能还在访问内存。正确顺序是每个 hart 报告完成并进入退出 barrier，最后由约定 hart 执行一次全局关闭。
 
 之前的实验都在单核环境下进行。在本次实验中，你需要修改操作系统内核使其支持两核并发运行，并且在每个核上加载一个程序运行，等到两个程序都执行完毕后退出并关闭模拟器。
 
