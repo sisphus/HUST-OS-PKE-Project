@@ -574,21 +574,22 @@ int rfs_disk_stat(struct vinode *vinode, struct istat *istat) {
 // create a hard link under a direntry "parent" for an existing file of "link_node"
 //
 int rfs_link(struct vinode *parent, struct dentry *sub_dentry, struct vinode *link_node) {
-  // TODO (lab4_3): we now need to establish a hard link to an existing file whose vfs
-  // inode is "link_node". To do that, we need first to know the name of the new (link)
-  // file, and then, we need to increase the link count of the existing file. Lastly, 
-  // we need to make the changes persistent to disk. To know the name of the new (link)
-  // file, you need to stuty the structure of dentry, that contains the name member;
-  // To incease the link count of the existing file, you need to study the structure of
-  // vfs inode, since it contains the inode information of the existing file.
-  //
-  // hint: to accomplish this experiment, you need to:
-  // 1) increase the link count of the file to be hard-linked;
-  // 2) append the new (link) file as a dentry to its parent directory; you can use 
-  //    rfs_add_direntry here.
-  // 3) persistent the changes to disk. you can use rfs_write_back_vinode here.
-  //
-  panic("You need to implement the code for creating a hard link in lab4_3.\n" );
+  // A hard link reuses the existing inode.  Only the directory gets a new
+  // name-to-inode entry; no new inode or data block is allocated.
+  link_node->nlinks++;
+
+  // Persist the new name in the parent directory.  If this fails, undo the
+  // in-memory link-count change because the link was not created.
+  if (rfs_add_direntry(parent, sub_dentry->name, link_node->inum) != 0) {
+    link_node->nlinks--;
+    return -1;
+  }
+
+  // Persist the incremented link count in the existing disk inode.
+  if (rfs_write_back_vinode(link_node) != 0)
+    return -1;
+
+  return 0;
 }
 
 //

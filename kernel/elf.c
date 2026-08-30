@@ -8,6 +8,7 @@
 #include "riscv.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "util/functions.h"
 #include "spike_interface/spike_utils.h"
 
 typedef struct elf_info_t {
@@ -19,18 +20,31 @@ typedef struct elf_info_t {
 // the implementation of allocater. allocates memory space for later segment loading.
 // this allocater is heavily modified @lab2_1, where we do NOT work in bare mode.
 //
-static void *elf_alloc_mb(elf_ctx *ctx, uint64 elf_pa, uint64 elf_va, uint64 size) {
+static uint64 elf_alloc_mb(elf_ctx *ctx, uint64 elf_va, uint64 size, uint32 flags) {
   elf_info *msg = (elf_info *)ctx->info;
-  // we assume that size of proram segment is smaller than a page.
-  kassert(size < PGSIZE);
-  void *pa = alloc_page();
-  if (pa == 0) panic("uvmalloc mem alloc falied\n");
+  uint64 segment_start = ROUNDDOWN(elf_va, PGSIZE);
+  uint64 segment_end = ROUNDUP(elf_va + size, PGSIZE);
+  uint64 npages = (segment_end - segment_start) / PGSIZE;
+  int prot = 0;
 
-  memset((void *)pa, 0, PGSIZE);
-  user_vm_map((pagetable_t)msg->p->pagetable, elf_va, PGSIZE, (uint64)pa,
-         prot_to_type(PROT_WRITE | PROT_READ | PROT_EXEC, 1));
+  if (flags & SEGMENT_READABLE) prot |= PROT_READ;
+  if (flags & SEGMENT_WRITABLE) prot |= PROT_WRITE;
+  if (flags & SEGMENT_EXECUTABLE) prot |= PROT_EXEC;
 
-  return pa;
+  for (uint64 i = 0; i < npages; i++) {
+    void *pa = alloc_page();
+    if (pa == 0) panic("uvmalloc mem alloc falied\n");
+
+    // A freshly allocated page backs one page of the virtual segment.  Zeroing
+    // it also provides the required zero-filled area for BSS bytes beyond
+    // ph_addr.filesz.
+    memset(pa, 0, PGSIZE);
+    user_vm_map((pagetable_t)msg->p->pagetable,
+      segment_start + i * PGSIZE, PGSIZE, (uint64)pa,
+      prot_to_type(prot, 1));
+  }
+
+  return npages;
 }
 
 //
@@ -76,12 +90,28 @@ elf_status elf_load(elf_ctx *ctx) {
     if (ph_addr.memsz < ph_addr.filesz) return EL_ERR;
     if (ph_addr.vaddr + ph_addr.memsz < ph_addr.vaddr) return EL_ERR;
 
-    // allocate memory block before elf loading
-    void *dest = elf_alloc_mb(ctx, ph_addr.vaddr, ph_addr.vaddr, ph_addr.memsz);
+    // Allocate and map enough pages for the whole memory segment.  A segment
+    // may be larger than one page and its virtual address need not be page
+    // aligned, so the file contents are copied page by page below.
+    uint64 npages = elf_alloc_mb(ctx, ph_addr.vaddr, ph_addr.memsz, ph_addr.flags);
 
-    // actual loading
-    if (elf_fpread(ctx, dest, ph_addr.memsz, ph_addr.off) != ph_addr.memsz)
-      return EL_EIO;
+    // Load only the bytes present in the file.  The pages were zeroed during
+    // allocation, so the rest of the memory segment remains zero-filled.
+    uint64 loaded = 0;
+    while (loaded < ph_addr.filesz) {
+      uint64 va = ph_addr.vaddr + loaded;
+      uint64 page_va = ROUNDDOWN(va, PGSIZE);
+      uint64 page_offset = va - page_va;
+      uint64 pa = lookup_pa((pagetable_t)((elf_info *)ctx->info)->p->pagetable,
+        page_va);
+      uint64 bytes = MIN(ph_addr.filesz - loaded, PGSIZE - page_offset);
+
+      if (pa == 0 || elf_fpread(ctx, (void *)(pa + page_offset), bytes,
+          ph_addr.off + loaded) != bytes)
+        return EL_EIO;
+
+      loaded += bytes;
+    }
 
     // record the vm region in proc->mapped_info. added @lab3_1
     int j;
@@ -89,7 +119,7 @@ elf_status elf_load(elf_ctx *ctx) {
       if( (process*)(((elf_info*)(ctx->info))->p)->mapped_info[j].va == 0x0 ) break;
 
     ((process*)(((elf_info*)(ctx->info))->p))->mapped_info[j].va = ph_addr.vaddr;
-    ((process*)(((elf_info*)(ctx->info))->p))->mapped_info[j].npages = 1;
+    ((process*)(((elf_info*)(ctx->info))->p))->mapped_info[j].npages = npages;
 
     // SEGMENT_READABLE, SEGMENT_EXECUTABLE, SEGMENT_WRITABLE are defined in kernel/elf.h
     if( ph_addr.flags == (SEGMENT_READABLE|SEGMENT_EXECUTABLE) ){
