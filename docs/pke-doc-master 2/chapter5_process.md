@@ -1,5 +1,45 @@
 # 第五章．实验3：进程管理
 
+> 本章把“进程”理解为一组必须同时切换和管理的状态，而不是一个正在执行的 C 函数。PKE 每次调度都要回答：**谁是当前进程、它的寄存器在哪里、它使用哪张页表、它处于什么状态、它在哪个队列、下一次怎样恢复？**
+
+#### 本章前置知识
+
+- 理解 trapframe 保存用户寄存器，`return_to_user()` 会恢复它们；
+- 理解每个进程拥有自己的页表和用户地址空间；
+- 知道内核可以通过定时器 trap 获得调度时机；
+- 能区分物理页所有权、页表映射和虚拟地址数值。
+
+#### 本章学习路线
+
+1. 先在 5.1 建立 process、trapframe、pagetable、mapped info 和队列模型；
+2. lab3_1 用 fork 创建“几乎相同但能独立继续”的子进程；
+3. lab3_2 用 yield 主动让出 CPU，并保持当前进程不丢失；
+4. lab3_3 用定时器和 FIFO ready queue 实现循环轮转；
+5. challenge1 用 wait/exit 建立父子同步并复制私有数据；
+6. challenge2 用 semaphore wait queue 管理资源计数和阻塞；
+7. challenge3 用 COW 把“立即复制”推迟到第一次写入。
+
+#### 稳定的进程对象模型
+
+| 组成 | 回答的问题 | 典型所有者 |
+| --- | --- | --- |
+| trapframe | 用户寄存器和返回 PC 在哪里 | 每进程一份 |
+| pagetable | 这个进程的 VA 怎样解释 | 每进程一份 |
+| mapped info | 哪些区间映射了什么用途 | 每进程记录 |
+| kernel stack | 该进程陷入内核时用哪段栈 | 每进程一份 |
+| parent/children | wait/exit 唤醒谁 | 进程关系 |
+| status | READY/RUNNING/BLOCKED/ZOMBIE 等 | 调度器修改 |
+| queue node | 当前位于哪个等待或就绪队列 | 一个时刻至多属于合适的一个队列 |
+
+#### 学完后你应该能回答
+
+- fork 返回后，父子为什么从同一位置继续，却在 `a0` 看到不同返回值？
+- 当前进程 yield 时，为什么必须先入 ready queue 再切换？
+- FIFO ready queue 怎样形成 round-robin，而不是只运行最后入队的进程？
+- wait 为什么要把父进程置为 BLOCKED，子进程退出后怎样唤醒它？
+- 信号量的 count 与等待队列分别表达什么？
+- COW fork 时为什么连父进程 PTE 也必须清除写权限？
+
 ### 目录 
 
 - [5.1 实验3的基础知识](#fundamental) 
@@ -35,11 +75,33 @@
 
 ## 5.1 实验3的基础知识
 
+#### 先区分“保存上下文”和“选择下一个进程”
+
+trap 入口负责把当前用户寄存器保存进当前进程的 trapframe；调度器负责更新状态和队列、选择另一个 process；`switch_to()`/返回路径负责安装新进程页表和 trap 上下文。三者是一条链，但职责不同。
+
+一次典型切换可以写成：
+
+`当前用户进程 → trap 保存寄存器 → RUNNING 改为 READY/BLOCKED → 放入对应队列 → 取出下一个 READY → 设为 RUNNING/current → 安装页表与 trapframe → 返回用户态`
+
+如果中间任何一步漏掉，表现可能是进程永久消失、同一进程重复入队、恢复别人的寄存器，或在错误页表下执行。
+
 完成了实验1和实验2的读者，应该对PKE实验中的“进程”不会太陌生。因为实际上，我们从最开始的lab1_1开始就有了进程结构（struct process），只是在之前的实验中，进程结构中最重要的成员是trapframe和kstack，它们分别用来记录系统进入S模式前的进程上下文以及作为进入S模式后的操作系统栈。在实验3，我们将进入多任务环境，完成PKE实验环境下的进程创建、换入换出，以及进程调度相关实验。
 
 <a name="subsec_process_structure"></a>
 
 ### 5.1.1 多任务环境下进程的封装
+
+#### process 结构是运行状态的所有权边界
+
+单任务版本可以依赖一份全局 trapframe 和固定页表；多任务版本不行。`process` 必须把“切走后还要恢复”的状态组织起来，包括 trapframe、页表、映射记录、内核栈、进程号、状态和调度节点。
+
+`current` 只是当前 hart 指向正在运行 process 的引用，不是所有进程状态本身。不同进程的 `current` 指向对象不同，多 hart 时每个 hart 还要有自己的当前进程引用。
+
+#### 判断字段该放哪里的方法
+
+问一句：“两个进程同时存在时，这个值可以不同吗？”如果答案是可以，例如页表、用户栈、trapframe、父进程、状态，就通常应在 process 中按进程保存；若多个进程共同使用且生命周期独立，则需要共享对象和同步规则。
+
+**常见错误：**只复制 process 结构体指针，不复制/重新建立其拥有的资源。这样父子会意外共用可写 trapframe、栈或页表元数据。
 
 实验3跟之前的两个实验最大的不同，在于在实验3的3个基本实验中，PKE操作系统将需要支持多个进程的执行。为了对多任务环境进行支撑，PKE操作系统定义了一个“进程池”（见kernel/process.c文件）：
 
@@ -166,6 +228,14 @@ sys_user_free_page的函数定义如下：
 <a name="subsec_switch"></a>
 
 ### 5.1.2 进程的启动与终止
+
+#### 启动是组装状态，终止是按所有权拆除状态
+
+创建进程时要分配 process、页表、trapframe、用户/内核栈，装载或映射代码和数据，初始化入口 PC、用户 SP 与参数，并把状态置为可调度。调度器选中后，才真正进入用户态执行。
+
+终止时不能只把函数返回。内核要记录退出状态，处理子进程/父进程关系，唤醒等待者，解除进程映射，并在不再引用时回收页表和物理页。COW 等共享页还需要引用计数，不能因为一个进程退出就直接释放。
+
+**边界提醒：**“进程已不再运行”和“所有资源已经可以回收”可能不是同一时刻。为让父进程读取退出信息，系统常保留一段 zombie 状态，直到 wait 完成。
 
 PKE实验中，创建一个进程需要先调用kernel/process.c文件中的alloc_process()函数：
 
@@ -368,6 +438,23 @@ PKE实验中，创建一个进程需要先调用kernel/process.c文件中的allo
 
 ### 5.1.3 就绪进程的管理与调度
 
+#### 队列保存的是未来执行机会
+
+READY 表示进程具备运行条件、正在等待 CPU；RUNNING 表示它当前占用某 hart；BLOCKED 表示它在等待某事件，即使 CPU 空闲也不能运行。状态与队列必须一致：READY 进程在 ready queue，等待某信号量的 BLOCKED 进程在该信号量自己的等待队列。
+
+FIFO ready queue 的基本操作是尾部入队、头部出队。yield 或时间片到期时，当前进程若仍可运行，先改为 READY 并放到队尾；调度器再从队头取下一个。若直接覆盖 `current` 而未保存/入队，原进程就失去了未来执行机会。
+
+#### 一个最小状态迁移表
+
+| 事件 | 迁移 | 队列动作 |
+| --- | --- | --- |
+| 创建完成 | NEW → READY | 入 ready queue 尾 |
+| 被调度 | READY → RUNNING | 从 ready queue 头移除 |
+| yield/时间片到 | RUNNING → READY | 入 ready queue 尾 |
+| wait/down 不能继续 | RUNNING → BLOCKED | 入对应等待队列 |
+| 子进程退出/up 唤醒 | BLOCKED → READY | 从等待队列移到 ready queue |
+| exit | RUNNING → ZOMBIE/EXITED | 不再进入 ready queue |
+
 PKE的操作系统设计了一个非常简单的就绪队列管理（因为实验3的基础实验并未涉及进程的阻塞，所以未设计阻塞队列），队列头在kernel/sched.c文件中定义：
 
 ```
@@ -448,6 +535,25 @@ PKE操作系统内核通过调用schedule()函数来完成进程的选择和换�
 <a name="lab3_1_naive_fork"></a>
 
 ## 5.2 lab3_1 进程创建（fork）（[头歌实验链接](https://www.educoder.net/shixuns/lf3vgx7c/challenges)）
+
+#### fork 的表面与本质
+
+表面上，fork 返回两次：父进程得到子进程 pid，子进程得到 `0`。本质上，内核创建了第二份可恢复状态，让父子 trapframe 的 PC 都位于系统调用之后，但把保存的 `a0` 改成不同结果。
+
+#### 端到端调用链
+
+`父进程 fork() → ecall → do_fork → 分配 child process/页表/trapframe/栈 → 建立子地址空间映射 → child trapframe.a0 = 0 → child READY 入队 → 父 trapframe.a0 = child pid → 父返回`
+
+建立子进程映射时必须写入 `child->pagetable`，不能误写父进程页表。映射完成后，还要把 `va`、`npages` 和 `CODE_SEGMENT` 等用途记录到子进程的 `mapped_info`，否则退出回收和后续复制无法知道这些页属于什么区域。
+
+#### 所有权检查
+
+- 父子 trapframe 必须独立，否则一个进程 trap 会覆盖另一个；
+- 子进程页表对象独立，即使某些只读代码页暂时映射同一 PA；
+- 用户栈和需要私有修改的数据不能无条件共享可写物理页；
+- child 入 ready queue 后才能在未来被调度。
+
+**验证重点：**父子从 fork 后同一位置继续，返回值分别为 pid 与 0；父进程后续页表修改不会错误写进 child，child 也确实获得调度机会。
 
 <a name="lab3_1_app"></a>
 
@@ -692,6 +798,23 @@ $ git commit -a -m "my work on lab3_1 is done."
 
 ## 5.3 lab3_2 进程yield（[头歌实验链接](https://www.educoder.net/shixuns/e7q4csmt/challenges)）
 
+#### yield 是主动交还 CPU，不是结束
+
+当前 RUNNING 进程调用 yield 时仍具备运行条件，所以它应转为 READY 并放到 ready queue 队尾。调度器从队头选择另一个 READY 进程；未来轮到原进程时，从其 trapframe 中 yield 系统调用之后的位置继续。
+
+#### 正确顺序
+
+1. trap 已保存当前用户寄存器；
+2. 把 `current->status` 从 RUNNING 改为 READY；
+3. 把 current 入 ready queue 尾；
+4. 从队头取下一个进程；
+5. 更新 current 和新进程状态；
+6. 安装新页表/trapframe 并返回用户态。
+
+若先切换 `current` 再保存旧引用，或不把旧进程入队，就会“失去进程”；若重复入队，同一个 process 可能同时出现多次。
+
+**验证重点：**两个进程按 FIFO 顺序交替打印；yield 后原进程会再次运行，而不是永久消失或从函数开头重启。
+
 <a name="lab3_2_app"></a>
 
 #### **给定应用**
@@ -888,6 +1011,18 @@ $ git commit -a -m "my work on lab3_2 is done."
 <a name="lab3_3_rrsched"></a>
 
 ## 5.4 lab3_3 循环轮转调度（[头歌实验链接](https://www.educoder.net/shixuns/3cvhjfw4/challenges)）
+
+#### 从主动 yield 到被动时间片
+
+round-robin 复用同一 ready queue 规则，只是切换触发源变成定时器。当当前进程用完时间片且仍可运行，就执行与 yield 类似的 RUNNING→READY 转移；然后从队头取下一个。
+
+#### 一次时间片切换
+
+`timer trap 保存 current → tick/时间片计数更新 → 时间片到期 → current 入队尾 → next 从队头出队 → next RUNNING → 设置下一次 timer → 返回 next`
+
+如果只有一个可运行进程，可以继续运行它或经过队列后重新选中它；关键是不制造空 current。若有两个 READY 进程，FIFO 的“尾入头出”让它们轮流得到 CPU，而不是总选择 pid 最小/最后创建者。
+
+**边界提醒：**定时器 handler 提供调度时机，ready queue 提供候选集合，调度策略决定选谁。三者不是同一个模块。
 
 <a name="lab3_3_app"></a>
 
@@ -1101,6 +1236,22 @@ $ git commit -a -m "my work on lab3_3 is done."
 
 ## 5.5 lab3_challenge1 进程等待和数据段复制（难度：&#9733;&#9733;&#9734;&#9734;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/hwtam4is/challenges)）
 
+#### wait 解决的是父子生命周期同步
+
+父进程调用 wait 时，如果目标子进程尚未退出，父进程不能继续假装已经获得退出结果。它应进入 BLOCKED，并从可调度集合移除。子进程 exit 时查找等待自己的父进程，把退出信息写入约定位置，再将父进程改为 READY 并放入 ready queue。
+
+若没有匹配子进程或等待条件不合法，系统调用返回 `-1`；若子进程已经退出，则可以直接回收并返回，不必先阻塞。
+
+#### 代码可以共享，数据必须体现进程私有语义
+
+只读代码段表达相同执行逻辑，可以由父子不同页表映射到同一只读物理页；数据段会被各进程修改，因此普通 fork 需要为子进程分配新的数据页、复制内容，并写入 `child->pagetable`。仅仅因为两个 VA 相同，不代表它们应该映射同一可写 PA。
+
+一次私有数据复制是：
+
+`遍历父数据映射 → 为 child 分配新页 → 复制父页内容 → 在 child pagetable 映射同一 VA → 记录 child mapped_info`
+
+**验证重点：**子进程修改数据后父进程看到的值保持不变；父进程 wait 时为 BLOCKED，子进程退出后变为 READY 并获得正确结果。
+
 <a name="lab3_challenge1_app"></a>
 
 #### **给定应用**
@@ -1238,6 +1389,23 @@ $ git merge lab3_3_rrsched -m "continue to work on lab3_challenge1"
 <a name="lab3_challenge2_semaphore"></a>
 
 ## 5.6 lab3_challenge2 实现信号量（难度：&#9733;&#9733;&#9733;&#9734;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/ehb5zf9f/challenges)）
+
+#### count 和等待队列表达两件事
+
+信号量 count 表示当前可立即取得的资源许可数；等待队列保存因该信号量而 BLOCKED 的进程。每个信号量必须有自己的等待队列，否则对 A 的 `up` 可能错误唤醒等待 B 的进程。
+
+#### down 与 up 的状态变化
+
+- `down`：若 count 大于 0，原子地减 1 并继续；否则把当前进程置为 BLOCKED，加入该信号量等待队列，再调度其他进程；
+- `up`：若等待队列非空，通常唤醒一个进程并将其置为 READY；若无人等待，则增加 count。
+
+互斥场景的初始 count 通常为 `1`：第一个进程取得后变为 0，第二个进程只能 blocked。一次 `up` 只对应一个许可，因此只唤醒一个等待者。
+
+#### 并发不变量
+
+count 检查/修改、等待队列入队/出队和进程状态变化必须处于合适的临界区。否则两个 hart 或两个可抢占路径可能同时取得最后一个许可，或让进程既在 ready queue 又在 semaphore queue。
+
+**验证重点：**临界区同一时刻只有一个进程进入；等待者位于正确 semaphore 的队列；`up` 后恰好一个进程从 BLOCKED 变为 READY。
 
 <a name="lab3_challenge2_app"></a>
 
@@ -1444,6 +1612,22 @@ $ git merge lab3_3_rrsched -m "continue to work on lab3_challenge1"
 <a name="lab3_challenge3_cow"></a>
 
 ## 5.7 lab3_challenge3 写时复制（Copy On Write）（难度：&#9733;&#9733;&#9733;&#9734;&#9734;，[头歌实验链接](https://www.educoder.net/shixuns/lfhrecys/challenges)）
+
+#### COW 推迟复制，但不能放弃隔离
+
+fork 时父子页表可以暂时映射同一物理数据页，以避免立即复制；但两个 PTE 都必须清除写权限并标记 COW。若只清 child 的写权限，父进程仍可直接修改共享页，子进程会无感知地看到变化，完全绕过 COW。
+
+#### 第一次写入的完整流程
+
+`父或子 store → PTE 存在但不可写 → CAUSE_STORE_PAGE_FAULT → handler 找到 COW PTE → 从 PTE 取旧 PA → 分配新物理页 → 复制旧页 → 当前进程 PTE 改指新页并恢复写权限 → 更新旧页引用计数 → 保持 sepc → 原 store 重试`
+
+这里的 page fault 含义是“页面存在但当前不能写”，不是“页面完全没有映射”。handler 必须先确认 COW 标记，不能把所有写权限 fault 都当作 COW。
+
+#### 为什么需要引用计数
+
+旧物理页可能同时被父进程、多个子进程映射。一个进程完成私有复制后，只能减少旧页引用；引用未归零时不能 `free_page()`。若写入者已经是旧页唯一引用者，可以按设计直接恢复写权限，避免无意义复制。
+
+**验证重点：**fork 后读操作不复制且父子看到相同初值；任一方第一次写入只改变自己的视图；旧共享页在仍有引用时不会被释放；fault 返回后重试原 store，而不是跳过写入。
 
 <a name="lab3_challenge3_app"></a>
 
